@@ -1,0 +1,1 @@
+/usr/bin/c++    -std=c++11 -mrtm -pthread    CMakeFiles/ArchTutorial3.dir/sharing.cpp.o CMakeFiles/ArchTutorial3.dir/helper.cpp.o  -o ArchTutorial3 -rdynamic 

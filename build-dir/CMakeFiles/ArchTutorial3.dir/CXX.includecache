@@ -1,0 +1,60 @@
+#IncludeRegexLine: ^[ 	]*#[ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/users/ugrad/ohaganci/Documents/cs4021/Tutorial 3/helper.h
+stdafx.h
+/users/ugrad/ohaganci/Documents/cs4021/Tutorial 3/stdafx.h
+iomanip
+-
+locale
+-
+intrin.h
+-
+unistd.h
+-
+cpuid.h
+-
+string.h
+-
+pthread.h
+-
+x86intrin.h
+-
+sys/mman.h
+-
+limits.h
+-
+
+/users/ugrad/ohaganci/Documents/cs4021/Tutorial 3/sharing.cpp
+stdafx.h
+/users/ugrad/ohaganci/Documents/cs4021/Tutorial 3/stdafx.h
+iostream
+-
+iomanip
+-
+helper.h
+/users/ugrad/ohaganci/Documents/cs4021/Tutorial 3/helper.h
+random
+-
+assert.h
+-
+fstream
+-
+
+/users/ugrad/ohaganci/Documents/cs4021/Tutorial 3/stdafx.h
+targetver.h
+/users/ugrad/ohaganci/Documents/cs4021/Tutorial 3/targetver.h
+stdio.h
+-
+stdlib.h
+-
+tchar.h
+-
+Windows.h
+-
+
