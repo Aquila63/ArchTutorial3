@@ -46,6 +46,7 @@
 
 #include <random>	
 #include <assert.h>
+#include <queue>
 
 #include <fstream>
 using namespace std;                            // cout
@@ -73,47 +74,6 @@ using namespace std;                            // cout
 #define GINDX(n)    (g+n*lineSz/sizeof(VINT))   //
 #endif
 
-
-#pragma region MCS_INIT
- /*
-template <class T>
-	class ALIGNEDMA
-	{
-	public:
-		void* operator new(size_t); //override new
-		void operator delete(void*); //override delete
-	};
-
-template<class T> 
-void* ALIGNEDMA<T>::operator new(size_t sz) //aligned memory allocator
-{
-	sz = (sz + lineSz - 1) / lineSz * lineSz; //Make sz a multiple of lineSz
-	return _aligned_malloc(sz, lineSz);	//Allocate on a lineSz boundary
-}
-
-template <class T>
-void ALIGNEDMA<T>::operator delete(void* p)
-{
-	_aligned_free(p);
-}
-
-//MCS Lock
-class QNode : public ALIGNEDMA<QNode>
-{
-public:
-	volatile int waiting;
-	volatile QNode *next;
-
-	QNode()
-	{
-		this->waiting = 0;
-		this->next = NULL;
-	}
-};
-*/
-#pragma endregion MCS_INIT
-
-
 int bound = 0;
 
 int upperBounds[] =
@@ -132,7 +92,7 @@ int upperBounds[] =
 				2	-> BST w/ HLE
 				3	-> BST w/ RTM
 */
-#define TREE_TYPE	0		
+#define TREE_TYPE	2		
 
 /**
 	RTM_TYPE	= 0	-> Standard RTM (No Backoff/retries)
@@ -226,25 +186,15 @@ public:
 
 	void initialize(int upper);
 	//int contains(INT64 key);
-	void add(Node *nm);
+	int add(Node *n);
 	Node* createNode(UINT64 value);
 	void createAndInsert(UINT64 value);
-	Node* volatile remove(UINT64 key);
+	Node* remove(UINT64 key);
 	int size(Node* root);
 
 	int getNodeCount()
 	{
 		return this->nodeCount;
-	}
-
-	void incNodeCount()
-	{
-		this->nodeCount++;
-	}
-
-	void decNodeCount()
-	{
-		this->nodeCount--;
 	}
 
 private:
@@ -253,12 +203,12 @@ private:
 
 //int BST::contains(INT64 key) {}
 
-void BST::add(Node *n)
+int BST::add(Node *n)
 {
 	if (root == NULL)
 	{
 		root = n;
-		return;
+		return 1;
 	}
 
 	Node* volatile* pp = &root;
@@ -275,11 +225,12 @@ void BST::add(Node *n)
 		}
 		else
 		{
-			return;
+			return 0;
 		}
 		p = *pp;
 	}
 	*pp = n;
+	return 1;
 }
 
 Node* BST::createNode(UINT64 value)
@@ -297,7 +248,7 @@ void BST::createAndInsert(UINT64 value)
 	this->add(n);
 }
 
-Node* volatile BST::remove(UINT64 key)
+Node* BST::remove(UINT64 key)
 {
 	Node* volatile *pp = &root;
 	Node* volatile p = root;
@@ -392,24 +343,20 @@ BST* volatile tree;
 												// 1:InterlockedIncrement
 												// 2:InterlockedCompareExchange
 												// 3:RTM (restricted transactional memory)
-												// 4:Bakery Lock
-												// 5:TestAndSet Lock
-												// 6:TestAndTestAndSet Lock
-												// 7:MCS Lock
 #define MAXTHREAD 8
 int number[MAXTHREAD];
 volatile int choosing[MAXTHREAD];
 int pid = 0;
 
-//DWORD tlsIndex = TlsAlloc();
-//DWORD tlsIndex;
-//QNode* mcsLock;	//MCS Lock
-//volatile UINT64 lock = 0;
-
 volatile long long lock = 0;		//Everything Else
 
 #define MINBACKOFF 4				//RTM retry value
 #define LOCKBACKOFF 16
+
+//Instead of "reusing", I preallocate x nodes before the timer is started.
+#define REUSE_NODES	0		//Switch for using a node reuse Queue
+#define REUSE_Q_SIZE	10000000
+queue<Node*> reuseQ;
 
 #define OPTYP   0                    // set op type
 
@@ -460,45 +407,6 @@ volatile long long lock = 0;		//Everything Else
 #endif
 #pragma endregion LOCK_MACROS
 
-#pragma region MCSLOCK
-/*
-DWORD tlsIndex = TlsAlloc();
-void mcsAcquire(QNode **lock)
-{
-	volatile QNode *qn = (QNode*)TlsGetValue(tlsIndex);
-	qn->next = NULL;
-	volatile QNode *pred = (QNode*)InterlockedExchangePointer((PVOID*)lock, (PVOID)qn);
-	if (pred == NULL)
-	{
-		return;
-	}
-	qn->waiting = 1;
-	pred->next = qn;
-	while (qn->waiting)
-	{
-		//MCS goes absolutely nuts without this Sleep operation
-		Sleep(0);
-	}
-}
-
-inline void mcsRelease(QNode **lock)
-{
-	volatile QNode *qn = (QNode*)TlsGetValue(tlsIndex); 
-	volatile QNode *succ; 
-	if (!(succ = qn->next)) 
-	{ 
-		if (InterlockedCompareExchangePointer((PVOID*)lock, NULL, (PVOID)qn) == qn)
-			return; 
-		do 
-		{ 
-			succ = qn->next; 
-		} while (!succ); 
-	}
-	succ->waiting = 0;
-}
-*/
-#pragma endregion MCSLOCK
-
 #pragma region TTAS_LOCK
 
 void ttas_acquire()
@@ -529,9 +437,11 @@ void ttas_release()
 
 void hle_acquire()
 {
+//Won't recognize the remap declared in helper, have to do it manually	
 #ifdef WIN32
 	while (_InterlockedExchange64_HLEAcquire(&lock, 1))							\
 	{																			\
+		nabort++;																\
 		do																		\
 		{																		\
 			_mm_pause();														\
@@ -540,6 +450,7 @@ void hle_acquire()
 #elif __linux__
 	while (__atomic_exchange_n(&lock, 1, __ATOMIC_ACQUIRE | __ATOMIC_HLE_ACQUIRE))\
 	{																			\
+		nabort++;																\
 		do																		\
 		{																		\
 			_mm_pause();														\
@@ -565,9 +476,25 @@ void hle_release()
 
 Node* createNode(UINT64 value)
 {
+#if REUSE_NODES == 1
+	if (reuseQ.empty() || reuseQ.front() == NULL)
+	{
+		Node* volatile n = new Node();
+		n->key = value;
+		return n;
+	}
+	else
+	{
+		Node* volatile n = reuseQ.front();
+		reuseQ.pop();
+		n->key = value;
+		return n;
+	}
+#else 
 	Node* volatile n = new Node();
 	n->key = value;
 	return n;
+#endif
 }
 
 void standardInsert(UINT64 value)
@@ -575,6 +502,8 @@ void standardInsert(UINT64 value)
 	tree->createAndInsert(value);																						
 }
 
+///NOTE FUTURE SELF - GET SEGMENTATION FAULT ON REMOVE WITH STANDARD BST
+///BOUND  = 4096 USUALLY
 void standardInsert(Node* n)
 {
 	tree->add(n);
@@ -593,7 +522,6 @@ void ttasInsert(UINT64 value)
 
 	Node* n = createNode(value);
 
-	/// NOTE TO LATER SELF - CREATE NODES IN WORKER INSTEAD
 	ttas_acquire();
 	tree->add(n);
 	ttas_release();
@@ -632,11 +560,25 @@ void hleInsert(Node* n)
 void hleRemove(UINT64 value)
 {
 	hle_acquire();
+#if REUSE_NODES == 1
+	Node *r = tree->remove(value);
+	if (reuseQ.size() < REUSE_Q_SIZE)
+	{
+		reuseQ.push(r);
+		hle_release();
+	}
+	else
+	{
+		hle_release();
+		delete r;
+	}
+#else
 	tree->remove(value);
 	hle_release();
+#endif
 }
 
-//Because my laptop doesn't support RTM (I wonder why HLE isn't flagged)
+//Because my laptop doesn't support RTM
 #if TREE_TYPE == 3
 void rtmInsert(UINT64 value)
 {
@@ -658,7 +600,7 @@ void rtmInsert(UINT64 value)
 
 void rtmInsert(Node* n)
 {
-	Node* n = createNode(value);
+	//Node* n = createNode(value);
 
 	UINT status = _xbegin();
 	if (status == _XBEGIN_STARTED)
@@ -670,156 +612,129 @@ void rtmInsert(Node* n)
 	{
 		nabort++;
 		//On abort, attempt to acquire a standard lock and carry out the operation
-		ttasInsert(value);
+		//ttasInsert(value);
+		ttasInsert(n);
 	}
 }
 
-void rtmInsertAlt(UINT64 value)
-{
-	int backoff = MINBACKOFF;
-	volatile UINT64 wait = 0;
-	UINT status;
-	while (1)
-	{
-		if (backoff < LOCKBACKOFF)
-		{
-			status = _xbegin();
-		}
-		else
-		{
-			ttas_acquire();
-			status = -1;
-		}
-
-		if (status == _XBEGIN_STARTED)
-		{
-			if (backoff >= LOCKBACKOFF || lock == 0)
-			{
-				tree->createAndInsert(value);
-				if (backoff < LOCKBACKOFF)
-				{
-					_xend();
-				}
-				else
-				{
-					lock = 0;
-				}
-				return;
-			}
-		}
-		else
-		{
-			if (wait == 0)
-			{
-				//Can't get this damn intrinsic working on Linux
-				//while (_rdrand64_step((UINT64*)&wait) == 0);
-
-				//Using my generator instead
-				wait = rn.generate64(MAXUINT64);
-			}
-			wait &= (1ULL << backoff) - 1;
-			while (wait--);
-			backoff++;
-		}
-	}
-}
+#define MAXATTEMPT		8
+#define TRANSACTION		1
+#define LOCK			0
 
 void rtmInsertAlt(Node* n)
 {
-	int backoff = MINBACKOFF;
+	int state = TRANSACTION;
+	int attempt = 1;
 	volatile UINT64 wait = 0;
-	UINT status;
+
 	while (1)
 	{
-		if (backoff < LOCKBACKOFF)
+		UINT status = _XBEGIN_STARTED;
+		if (state == TRANSACTION)
 		{
 			status = _xbegin();
 		}
 		else
 		{
 			ttas_acquire();
-			status = -1;
 		}
 
 		if (status == _XBEGIN_STARTED)
 		{
-			if (backoff >= LOCKBACKOFF || lock == 0)
+			if (status == TRANSACTION && lock)
 			{
-				tree->add(n);
-				if (backoff < LOCKBACKOFF)
-				{
-					_xend();
-				}
-				else
-				{
-					lock = 0;
-				}
-				return;
+				_xabort(0xA0);
+				nabort++;
 			}
-		}
-		else
-		{
-			if (wait == 0)
-			{
-				//Can't get this damn intrinsic working on Linux
-				//while (_rdrand64_step((UINT64*)&wait) == 0);
 
-				//Using my generator instead
-				wait = rn.generate64(MAXUINT64);
+			tree->add(n);
+
+			if (state == TRANSACTION)
+			{
+				_xend();
 			}
-			wait &= (1ULL << backoff) - 1;
-			while (wait--);
-			backoff++;
+			else
+			{
+				lock = 0;
+			}
+			break;
+		}
+		else //Here on transaction abort
+		{
+			if (lock)
+			{
+				do {
+					_mm_pause();
+				} while (lock);
+			}
+			else
+			{
+				volatile UINT64 wait = attempt;
+				while (wait--);
+			}
+			if (++attempt >= MAXATTEMPT)
+			{
+				state = LOCK;
+			}
 		}
 	}
 }
 
 void rtmRemoveAlt(UINT64 value)
 {
-	int backoff = MINBACKOFF;
+	int state = TRANSACTION;
+	int attempt = 1;
 	volatile UINT64 wait = 0;
-	UINT status;
+
 	while (1)
 	{
-		if (backoff < LOCKBACKOFF)
+		UINT status = _XBEGIN_STARTED;
+		if (state == TRANSACTION)
 		{
 			status = _xbegin();
 		}
 		else
 		{
 			ttas_acquire();
-			status = -1;
 		}
 
 		if (status == _XBEGIN_STARTED)
 		{
-			if (backoff >= LOCKBACKOFF || lock == 0)
+			if (status == TRANSACTION && lock)
 			{
-				tree->remove(value);
-				if (backoff < LOCKBACKOFF)
-				{
-					_xend();
-				}
-				else
-				{
-					lock = 0;
-				}
-				return;
+				_xabort(0xA0);
+				nabort++;
 			}
-		}
-		else
-		{
-			if (wait == 0)
-			{
-				//Can't get this damn intrinsic working on Linux
-				//while (_rdrand64_step((UINT64*)&wait) == 0);
 
-				//Using my generator instead
-				wait = rn.generate64(MAXUINT64);
+			tree->remove(value);
+
+			if (state == TRANSACTION)
+			{
+				_xend();
 			}
-			wait &= (1ULL << backoff) - 1;
-			while (wait--);
-			backoff++;
+			else
+			{
+				lock = 0;
+			}
+			break;
+		}
+		else //Here on transaction abort
+		{
+			if (lock)
+			{
+				do {
+					_mm_pause();
+				} while (lock);
+			}
+			else
+			{
+				volatile UINT64 wait = attempt;
+				while (wait--);
+			}
+			if (++attempt >= MAXATTEMPT)
+			{
+				state = LOCK;
+			}
 		}
 	}
 }
@@ -851,7 +766,7 @@ int maxThread;                                  // max # of threads
 THREADH *threadH;                               // thread handles
 UINT64 *ops;                                    // for ops per thread
 
-#if OPTYP == 3 || TREE_TYPE == 3
+#if OPTYP == 3 || TREE_TYPE == 2 ||TREE_TYPE == 3
 UINT64 *aborts;                                 // for counting aborts
 #endif
 
@@ -877,83 +792,6 @@ ALIGN(64) UINT64 cnt1;
 ALIGN(64) UINT64 cnt2;
 UINT64 cnt3;                                    // NB: in Debug mode allocated in cache line occupied by cnt0
 
-												//
-												// PMS
-												//
-#ifdef USEPMS
-
-UINT64 *fixedCtr0;                              // fixed counter 0 counts
-UINT64 *fixedCtr1;                              // fixed counter 1 counts
-UINT64 *fixedCtr2;                              // fixed counter 2 counts
-UINT64 *pmc0;                                   // performance counter 0 counts
-UINT64 *pmc1;                                   // performance counter 1 counts
-UINT64 *pmc2;                                   // performance counter 2 counts
-UINT64 *pmc3;                                   // performance counter 2 counts
-
-												//
-												// zeroCounters
-												//
-void zeroCounters()
-{
-	for (UINT i = 0; i < ncpu; i++) {
-		for (int j = 0; j < 4; j++) {
-			if (j < 3)
-				writeFIXED_CTR(i, j, 0);
-			writePMC(i, j, 0);
-		}
-	}
-}
-
-//
-// void setupCounters()
-//
-void setupCounters()
-{
-	if (!openPMS())
-		quit();
-
-	//
-	// enable FIXED counters
-	//
-	for (UINT i = 0; i < ncpu; i++) {
-		writeFIXED_CTR_CTRL(i, (FIXED_CTR_RING123 << 8) | (FIXED_CTR_RING123 << 4) | FIXED_CTR_RING123);
-		writePERF_GLOBAL_CTRL(i, (0x07ULL << 32) | 0x0f);
-	}
-
-#if OPTYP == 3
-
-	//
-	// set up and enable general purpose counters
-	//
-	for (UINT i = 0; i < ncpu; i++) {
-		writePERFEVTSEL(i, 0, PERFEVTSEL_EN | PERFEVTSEL_USR | RTM_RETIRED_START);
-		writePERFEVTSEL(i, 1, PERFEVTSEL_EN | PERFEVTSEL_USR | RTM_RETIRED_COMMIT);
-		writePERFEVTSEL(i, 2, PERFEVTSEL_IN_TXCP | PERFEVTSEL_IN_TX | PERFEVTSEL_EN | PERFEVTSEL_USR | CPU_CLK_UNHALTED_THREAD_P);  // NB: TXCP in PMC2 ONLY
-		writePERFEVTSEL(i, 3, PERFEVTSEL_IN_TX | PERFEVTSEL_EN | PERFEVTSEL_USR | CPU_CLK_UNHALTED_THREAD_P);
-	}
-
-#endif
-
-}
-
-//
-// void saveCounters()
-//
-void saveCounters()
-{
-	for (UINT i = 0; i < ncpu; i++) {
-		fixedCtr0[indx*ncpu + i] = readFIXED_CTR(i, 0);
-		fixedCtr1[indx*ncpu + i] = readFIXED_CTR(i, 1);
-		fixedCtr2[indx*ncpu + i] = readFIXED_CTR(i, 2);
-		pmc0[indx*ncpu + i] = readPMC(i, 0);
-		pmc1[indx*ncpu + i] = readPMC(i, 1);
-		pmc2[indx*ncpu + i] = readPMC(i, 2);
-		pmc3[indx*ncpu + i] = readPMC(i, 3);
-	}
-}
-
-#endif
-
 //
 // worker
 //
@@ -970,9 +808,6 @@ WORKER worker(void *vthread)
 	VINT x;
 #elif OPTYP == 3 || TREE_TYPE == 3
 	UINT64 nabort = 0;
-#elif OPTYP == 7
-	QNode *qn = new QNode();
-	TlsSetValue(tlsIndex, qn);
 #endif
 
 	pid = thread;
@@ -983,7 +818,7 @@ WORKER worker(void *vthread)
 		//
 		// do some work
 		//
-		for (int i = 0; i < NOPS / 4; i++)
+		for (int i = 0; i < NOPS/16; i++)
 		{
 			switch (TREE_TYPE)
 			{
@@ -1057,14 +892,14 @@ WORKER worker(void *vthread)
 				{
 				case(0) :
 					if (RTM_TYPE == 0)
-						rtmInsert(value);
-					else if (RTM_TYPE == 1)
-						rtmInsertAlt(value);
+						rtmInsert(n);
+					else
+						rtmInsertAlt(n);
 					break;
 				case(1) :
 					if (RTM_TYPE == 0)
 						rtmRemove(value);
-					else if (RTM_TYPE == 1)
+					else
 						rtmRemoveAlt(value);
 					break;
 				}
@@ -1084,7 +919,7 @@ WORKER worker(void *vthread)
 	}
 
 	ops[thread] = n;
-#if OPTYP == 3 || TREE_TYPE == 3
+#if OPTYP == 3 || TREE_TYPE == 2 || TREE_TYPE == 3
 	aborts[thread] = nabort;
 #endif
 	return 0;
@@ -1164,7 +999,7 @@ int main()
 	if ((&cnt3 >= &cnt2) && (&cnt3 < (&cnt2 + lineSz / sizeof(UINT64))))
 		cout << "Warning: cnt2 shares cache line used by cnt1" << endl;
 
-#if OPTYP == 3
+#if OPTYP == 3 || TREE_TYPE == 3
 
 	//
 	// check if RTM supported
@@ -1187,7 +1022,7 @@ int main()
 	threadH = (THREADH*)ALIGNED_MALLOC(maxThread*sizeof(THREADH), lineSz);             // thread handles
 	ops = (UINT64*)ALIGNED_MALLOC(maxThread*sizeof(UINT64), lineSz);                   // for ops per thread
 
-#if OPTYP == 3 || TREE_TYPE == 3
+#if OPTYP == 3 || TREE_TYPE == 2 || TREE_TYPE == 3
 	aborts = (UINT64*)ALIGNED_MALLOC(maxThread*sizeof(UINT64), lineSz);                // for counting aborts
 #endif
 
@@ -1198,6 +1033,8 @@ int main()
 #endif
 	r = (Result*)ALIGNED_MALLOC(5 * maxThread*sizeof(Result), lineSz);                   // for results
 	memset(r, 0, 5 * maxThread*sizeof(Result));                                           // zero
+
+	//tree = (BST*)ALIGNED_MALLOC((maxThread + 1)*lineSz, lineSz);
 
 	indx = 0;
 
@@ -1219,10 +1056,10 @@ int main()
 	cout << "bound";
 	cout << setw(9) << "nt";
 	cout << setw(10) << "rt";
-	cout << setw(10) << "ops";
+	cout << setw(14) << "ops";
 	cout << setw(12) << "rel";
 	cout << setw(14) << "treeSize";
-#if OPTYP == 3 || TREE_TYPE == 3
+#if OPTYP == 3 || TREE_TYPE == 2 || TREE_TYPE == 3
 	cout << setw(8) << "commit";
 #endif
 	cout << endl;
@@ -1230,10 +1067,10 @@ int main()
 	cout << "-----";              // sharing
 	cout << setw(9) << "--";        // nt
 	cout << setw(10) << "--";        // rt
-	cout << setw(10) << "---";      // ops
+	cout << setw(14) << "---";      // ops
 	cout << setw(12) << "---";       // rel
 	cout << setw(14) << "------";
-#if OPTYP == 3 || TREE_TYPE == 3
+#if OPTYP == 3 || TREE_TYPE == 2|| TREE_TYPE == 3
 	cout << setw(8) << "------";
 #endif
 	cout << endl;
@@ -1262,14 +1099,18 @@ int main()
 		for (int nt = 1; nt <= maxThread; nt *= 2, indx++) {
 
 			tree->initialize(upperBounds[bound]);
-
+			for (int i = 0; i < REUSE_Q_SIZE; i++)
+			{
+				Node* n = new Node();
+				reuseQ.push(n);
+			}
 
 			//
 			//  zero shared memory
 			//
-			for (int thread = 0; thread < nt; thread++)
-				*(GINDX(thread)) = 0;   // thread local
-				*(GINDX(maxThread)) = 0;    // shared
+			//for (int thread = 0; thread < nt; thread++)
+			//	*(GINDX(thread)) = 0;   // thread local
+			//	*(GINDX(maxThread)) = 0;    // shared
 
 			//
 			// get start time
@@ -1295,14 +1136,15 @@ int main()
 										//
 										// save results and output summary to console
 										//
-			for (int thread = 0; thread < nt; thread++) {
+			for (int thread = 0; thread < nt; thread++) 
+			{
 				r[indx].ops += ops[thread];
-				//r[indx].incs += *(GINDX(thread));
-#if OPTYP == 3 || TREE_TYPE == 3
+				r[indx].incs += *(GINDX(thread));
+#if OPTYP == 3 || TREE_TYPE == 2 || TREE_TYPE == 3
 				r[indx].aborts += aborts[thread];
 #endif
 			}
-			//r[indx].incs += *(GINDX(maxThread));
+			r[indx].incs += *(GINDX(maxThread));
 			if ((sharing == 0) && (nt == 1))
 				ops1 = r[indx].ops;
 			r[indx].sharing = sharing;
@@ -1312,11 +1154,11 @@ int main()
 			cout << setw(8) << upperBounds[bound];
 			cout << setw(8) << nt;
 			cout << setw(10) << fixed << setprecision(2) << (double)rt / 1000;
-			cout << setw(10) << r[indx].ops;
+			cout << setw(14) << r[indx].ops;
 			cout << setw(12) << fixed << setprecision(2) << (double)r[indx].ops / ops1;
 			cout << setw(14) << tree->size(tree->root);
 
-#if OPTYP == 3 || TREE_TYPE == 3
+#if OPTYP == 3 || TREE_TYPE == 2 || TREE_TYPE == 3
 
 			cout << setw(7) << fixed << setprecision(0) << 100.0 * (r[indx].ops - r[indx].aborts) / r[indx].ops << "%";
 
@@ -1344,13 +1186,13 @@ int main()
 	//
 	setLocale();
 	cout << "bound/nt/rt/ops/incs";
-#if OPTYP == 3 || TREE_TYPE == 3
+#if OPTYP == 3 || TREE_TYPE == 2 || TREE_TYPE == 3
 	cout << "/aborts";
 #endif
 	cout << endl;
 	for (UINT i = 0; i < indx; i++) {
 		cout << r[i].sharing << "/" << r[i].nt << "/" << r[i].rt << "/" << r[i].ops << "/" << r[i].incs;
-#if OPTYP == 3 || TREE_TYPE == 3
+#if OPTYP == 3 || TREE_TYPE == 2 || TREE_TYPE == 3
 		cout << "/" << r[i].aborts;
 #endif      
 		cout << endl;
@@ -1365,3 +1207,5 @@ int main()
 }
 
 // eof
+//
+
